@@ -10,6 +10,7 @@
 (define-constant err-invalid-reward (err u106))
 (define-constant err-already-claimed (err u107))
 (define-constant err-not-verified (err u108))
+(define-constant err-invalid-streak (err u109))
 
 (define-data-var total-workers uint u0)
 (define-data-var total-kpis uint u0)
@@ -61,6 +62,16 @@
   }
 )
 
+(define-map worker-streaks
+  { worker-id: uint }
+  {
+    current-streak: uint,
+    best-streak: uint,
+    last-qualified-day: uint,
+    streak-bonus-earned: uint
+  }
+)
+
 (define-read-only (get-worker (worker-id uint))
   (map-get? workers { worker-id: worker-id })
 )
@@ -84,6 +95,10 @@
 
 (define-read-only (get-daily-stats (worker-id uint) (day uint))
   (map-get? daily-worker-stats { worker-id: worker-id, day: day })
+)
+
+(define-read-only (get-worker-streak (worker-id uint))
+  (map-get? worker-streaks { worker-id: worker-id })
 )
 
 (define-read-only (get-total-workers)
@@ -377,5 +392,98 @@
       total-earned: (get total-earned worker),
       active-status: (get active worker)
     })
+  )
+)
+
+(define-private (calculate-streak-multiplier (streak uint))
+  (if (>= streak u30)
+    u500
+    (if (>= streak u14)
+      u250
+      (if (>= streak u7)
+        u100
+        (if (>= streak u3)
+          u25
+          u0
+        )
+      )
+    )
+  )
+)
+
+(define-public (update-worker-streak (worker-id uint) (efficiency-score uint) (quality-score uint))
+  (let (
+    (worker (unwrap! (map-get? workers { worker-id: worker-id }) err-worker-not-found))
+    (current-day (/ stacks-block-height u144))
+    (existing-streak (default-to 
+      { current-streak: u0, best-streak: u0, last-qualified-day: u0, streak-bonus-earned: u0 }
+      (map-get? worker-streaks { worker-id: worker-id })
+    ))
+    (qualified (and (>= efficiency-score u75) (>= quality-score u80)))
+    (is-consecutive (is-eq (get last-qualified-day existing-streak) (- current-day u1)))
+    (new-streak (if qualified
+                  (if (or is-consecutive (is-eq (get current-streak existing-streak) u0))
+                    (+ (get current-streak existing-streak) u1)
+                    u1)
+                  u0))
+    (new-best (if (> new-streak (get best-streak existing-streak))
+                new-streak
+                (get best-streak existing-streak)))
+    (streak-bonus (if qualified (calculate-streak-multiplier new-streak) u0))
+  )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get active worker) err-invalid-worker)
+    
+    (map-set worker-streaks
+      { worker-id: worker-id }
+      {
+        current-streak: new-streak,
+        best-streak: new-best,
+        last-qualified-day: (if qualified current-day (get last-qualified-day existing-streak)),
+        streak-bonus-earned: (+ (get streak-bonus-earned existing-streak) streak-bonus)
+      }
+    )
+    
+    (if (> streak-bonus u0)
+      (begin
+        (try! (ft-mint? efficiency-token streak-bonus (get address worker)))
+        (map-set workers
+          { worker-id: worker-id }
+          (merge worker { total-earned: (+ (get total-earned worker) streak-bonus) })
+        )
+        (ok { streak: new-streak, bonus: streak-bonus })
+      )
+      (ok { streak: new-streak, bonus: u0 })
+    )
+  )
+)
+
+(define-read-only (get-streak-info (worker-id uint))
+  (let (
+    (streak-data (default-to
+      { current-streak: u0, best-streak: u0, last-qualified-day: u0, streak-bonus-earned: u0 }
+      (map-get? worker-streaks { worker-id: worker-id })
+    ))
+    (current-multiplier (calculate-streak-multiplier (get current-streak streak-data)))
+    (next-tier-at (if (>= (get current-streak streak-data) u30)
+                    u0
+                    (if (>= (get current-streak streak-data) u14)
+                      u30
+                      (if (>= (get current-streak streak-data) u7)
+                        u14
+                        (if (>= (get current-streak streak-data) u3)
+                          u7
+                          u3
+                        )
+                      )
+                    )))
+  )
+    {
+      current-streak: (get current-streak streak-data),
+      best-streak: (get best-streak streak-data),
+      total-streak-bonus: (get streak-bonus-earned streak-data),
+      current-multiplier: current-multiplier,
+      next-tier-at: next-tier-at
+    }
   )
 )
